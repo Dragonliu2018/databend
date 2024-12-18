@@ -30,6 +30,7 @@ pub use aggregate_rewriter::AggregateRewriter;
 pub use aggregating_index_visitor::AggregatingIndexChecker;
 pub use aggregating_index_visitor::AggregatingIndexRewriter;
 pub use aggregating_index_visitor::RefreshAggregatingIndexRewriter;
+pub use aggregating_index_visitor::RefreshAggregatingIndexUwheelRewriter;
 pub(crate) use async_function_rewriter::AsyncFunctionRewriter;
 pub use count_set_ops::CountSetOps;
 pub use distinct_to_groupby::DistinctToGroupBy;
@@ -52,3 +53,5 @@ pub use window_check::WindowChecker;
 
 pub(crate) const SUPPORTED_AGGREGATING_INDEX_FUNCTIONS: [&str; 6] =
     ["sum", "min", "max", "avg", "count", "approx_count_distinct"];
+
+pub(crate) const SUPPORTED_UWHEEL_FUNCTIONS: [&str; 4] = ["sum", "min", "max", "avg"];

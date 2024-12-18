@@ -60,6 +60,7 @@ pub struct RefreshIndexInterpreter {
     plan: RefreshIndexPlan,
 }
 
+// TODO-3: AggIndexUwheelTransformer
 impl RefreshIndexInterpreter {
     pub fn try_create(ctx: Arc<QueryContext>, plan: RefreshIndexPlan) -> Result<Self> {
         Ok(RefreshIndexInterpreter { ctx, plan })
@@ -222,7 +223,7 @@ impl Interpreter for RefreshIndexInterpreter {
                 metadata,
                 bind_context,
                 ..
-            } => {
+            } => { // schema: 0 2 3  bind_context: 0 2
                 let schema = if let RelOperator::EvalScalar(eval) = s_expr.plan() {
                     let fields = eval
                         .items
@@ -233,7 +234,25 @@ impl Interpreter for RefreshIndexInterpreter {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     DataSchemaRefExt::create(fields)
+                } else if let RelOperator::Sort(_) = s_expr.plan() {
+                    if let RelOperator::EvalScalar(eval) = s_expr.children().next().unwrap().plan() {
+                        let fields = eval
+                            .items
+                            .iter()
+                            .map(|item| {
+                                let ty = item.scalar.data_type()?;
+                                Ok(DataField::new(&item.index.to_string(), ty))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        DataSchemaRefExt::create(fields)
+                    } else {
+                        log::info!("plaan: {:?}", s_expr.plan());
+                        return Err(ErrorCode::SemanticError(
+                            "The last operator of the plan of aggregate index query should be EvalScalar",
+                        ));
+                    }
                 } else {
+                    log::info!("plaan: {:?}", s_expr.plan());
                     return Err(ErrorCode::SemanticError(
                         "The last operator of the plan of aggregate index query should be EvalScalar",
                     ));
@@ -281,7 +300,9 @@ impl Interpreter for RefreshIndexInterpreter {
         let mut replace_read_source = ReadSourceReplacer {
             source: new_read_source,
         };
+        log::info!("ouut1: {:?}", query_plan.clone().output_schema());
         query_plan = replace_read_source.replace(&query_plan)?;
+        log::info!("ouut2: {:?}", query_plan.clone().output_schema());
 
         let mut build_res =
             build_query_pipeline_without_render_result_set(&self.ctx, &query_plan).await?;
@@ -290,7 +311,15 @@ impl Interpreter for RefreshIndexInterpreter {
 
         // Build projection
         let mut projections = Vec::with_capacity(output_schema.num_fields());
+        // output_schema ×
+        // pre: 2 3
+        // cur: 0 2 3
+        // input_schema √
+        // pre: 3 2
+        // cur: 0 2
+        let mut idx = 0;
         for field in output_schema.fields().iter() {
+            log::info!("fiee: {:?}", field);
             let index = input_schema.index_of(field.name())?;
             projections.push(index);
         }

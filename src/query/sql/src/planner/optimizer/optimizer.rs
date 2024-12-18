@@ -19,6 +19,8 @@ use databend_common_ast::ast::ExplainKind;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRefExt;
 use educe::Educe;
 use log::info;
 
@@ -187,7 +189,7 @@ pub async fn optimize(mut opt_ctx: OptimizerContext, plan: Plan) -> Result<Plan>
     match plan {
         Plan::Query {
             s_expr,
-            bind_context,
+            bind_context, // 0 2
             metadata,
             rewrite_kind,
             formatted_ast,
@@ -392,13 +394,14 @@ pub async fn optimize_query(opt_ctx: &mut OptimizerContext, mut s_expr: SExpr) -
 
     // Normalize aggregate, it should be executed before RuleSplitAggregate.
     s_expr = RuleNormalizeAggregateOptimizer::new().run(&s_expr)?;
-
+    // 0 2
     // Pull up and infer filter.
     s_expr = PullUpFilterOptimizer::new(opt_ctx.metadata.clone()).run(&s_expr)?;
+    log::info!("ssexpr: {:?}", s_expr.clone());
 
     // Run default rewrite rules
     s_expr = RecursiveOptimizer::new(&DEFAULT_REWRITE_RULES, opt_ctx).run(&s_expr)?;
-
+    // 0 2 3
     // Run post rewrite rules
     s_expr = RecursiveOptimizer::new(&[RuleID::SplitAggregate], opt_ctx).run(&s_expr)?;
 
@@ -423,6 +426,7 @@ pub async fn optimize_query(opt_ctx: &mut OptimizerContext, mut s_expr: SExpr) -
         s_expr = RecursiveOptimizer::new([RuleID::CommuteJoin].as_slice(), opt_ctx).run(&s_expr)?;
     }
 
+    // 0 2 3
     // Cascades optimizer may fail due to timeout, fallback to heuristic optimizer in this case.
     s_expr = match cascades.optimize(s_expr.clone()) {
         Ok(mut s_expr) => {
@@ -453,6 +457,7 @@ pub async fn optimize_query(opt_ctx: &mut OptimizerContext, mut s_expr: SExpr) -
             .run(&s_expr)?;
     }
 
+    // 0 2 3
     Ok(s_expr)
 }
 

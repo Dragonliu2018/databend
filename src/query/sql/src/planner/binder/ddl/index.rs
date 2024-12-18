@@ -14,15 +14,20 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+use databend_common_ast::ast::ColumnID;
+use databend_common_ast::ast::ColumnRef;
 use databend_common_ast::ast::CreateIndexStmt;
 use databend_common_ast::ast::CreateInvertedIndexStmt;
 use databend_common_ast::ast::DropIndexStmt;
 use databend_common_ast::ast::DropInvertedIndexStmt;
 use databend_common_ast::ast::ExplainKind;
+use databend_common_ast::ast::Expr;
 use databend_common_ast::ast::Identifier;
+use databend_common_ast::ast::OrderByExpr;
 use databend_common_ast::ast::Query;
 use databend_common_ast::ast::RefreshIndexStmt;
 use databend_common_ast::ast::RefreshInvertedIndexStmt;
@@ -34,6 +39,8 @@ use databend_common_ast::parser::tokenize_sql;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::ColumnId;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRefExt;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableSchemaRef;
 use databend_common_license::license::Feature::AggregateIndex;
@@ -55,11 +62,13 @@ use crate::plans::DropTableIndexPlan;
 use crate::plans::Plan;
 use crate::plans::RefreshIndexPlan;
 use crate::plans::RefreshTableIndexPlan;
+use crate::plans::RelOperator;
 use crate::AggregatingIndexChecker;
 use crate::AggregatingIndexRewriter;
 use crate::BindContext;
 use crate::MetadataRef;
 use crate::RefreshAggregatingIndexRewriter;
+use crate::RefreshAggregatingIndexUwheelRewriter;
 use crate::SUPPORTED_AGGREGATING_INDEX_FUNCTIONS;
 
 // valid values for inverted index option tokenizer
@@ -191,6 +200,7 @@ impl Binder {
         Ok(())
     }
 
+    // TODO-1:
     #[async_backtrace::framed]
     pub(in crate::planner::binder) async fn bind_create_index(
         &mut self,
@@ -205,20 +215,33 @@ impl Binder {
             sync_creation,
         } = stmt;
 
-        // check if query support index
-        {
-            let mut agg_index_checker = AggregatingIndexChecker::default();
-            query.drive(&mut agg_index_checker);
-            if !agg_index_checker.is_supported() {
-                return Err(ErrorCode::UnsupportedIndex(format!(
-                    "Currently create aggregating index just support simple query, like: {}, \
-                     and these aggregate funcs: {}, \
-                     and non-deterministic functions are not support like: NOW()",
-                    "SELECT ... FROM ... WHERE ... GROUP BY ...",
-                    SUPPORTED_AGGREGATING_INDEX_FUNCTIONS.join(",")
-                )));
+        let mut options = HashMap::new();
+        let mut agg_index_checker = AggregatingIndexChecker::default();
+        query.drive(&mut agg_index_checker);
+
+        if !agg_index_checker.is_supported() {
+            return Err(ErrorCode::UnsupportedIndex(format!(
+                "Currently create aggregating index just support simple query, like: {}, \
+                 and these aggregate funcs: {}, \
+                 and non-deterministic functions are not support like: NOW()",
+                "SELECT ... FROM ... WHERE ... GROUP BY ...",
+                SUPPORTED_AGGREGATING_INDEX_FUNCTIONS.join(",")
+            )));
+        }
+
+        if agg_index_checker.is_support_uwheel() {
+            if let Some(time_col) = agg_index_checker.get_time_column() {
+                options.insert("time_column".to_string(), time_col.clone());
+
+                let watermark = if agg_index_checker.is_date_column() {
+                    "86400"
+                } else {
+                    "1"
+                };
+                options.insert("uwheel_watermark".to_string(), watermark.to_string());
             }
         }
+
         let mut original_query = query.clone();
         // pass checker, rewrite aggregate function
         // we will extract all agg function that select targets have
@@ -278,6 +301,7 @@ impl Binder {
             query: query.to_string(),
             table_id,
             sync_creation: *sync_creation,
+            options,
         };
         Ok(Plan::CreateIndex(Box::new(plan)))
     }
@@ -335,6 +359,7 @@ impl Binder {
         Ok(Plan::RefreshIndex(Box::new(plan)))
     }
 
+    // TODO-2:
     pub async fn build_refresh_index_plan(
         &mut self,
         bind_context: &mut BindContext,
@@ -344,8 +369,20 @@ impl Binder {
         limit: Option<u64>,
         segment_locs: Option<Vec<Location>>,
     ) -> Result<RefreshIndexPlan> {
+        // 测试值
+        let mut options = HashMap::new();
+        options.insert("time_column".to_string(), "ts".to_string());
+        options.insert("uwheel_watermark".to_string(), "1".to_string());
+
+        // todo: 如何生成 plan 里面的 schema?
         let tokens = tokenize_sql(&index_meta.query)?;
+        // let new_query = "SELECT id FROM test.t2 WHERE ts >= '2023-02-17T07:00:00Z' AND ts < '2023-02-17T08:00:00Z'";
+        // let tokens = tokenize_sql(new_query)?;
+
         let (mut stmt, _) = parse_sql(&tokens, self.dialect)?;
+        log::info!("stmmt1: {}", stmt);
+        // pre: SELECT SUM(id) FROM test.t2 WHERE ts >= '2023-02-17T07:00:00Z' AND ts < '2023-02-17T08:00:00Z'
+        // cur: SELECT id FROM test.t2 WHERE ts >= '2023-02-17T07:00:00Z' AND ts < '2023-02-17T08:00:00Z'
 
         // The file name and block only correspond to each other at the time of table_scan,
         // after multiple transformations, this correspondence does not exist,
@@ -358,18 +395,50 @@ impl Binder {
         // we no need add it and **MUST NOT** drop this column in sink phase.
 
         // And we will rewrite the agg function to agg state func in this rewriter.
-        let mut index_rewriter = RefreshAggregatingIndexRewriter::default();
-        stmt.drive_mut(&mut index_rewriter);
+        let mut user_defined_block_name = false;
+        if options.contains_key("uwheel_watermark") {
+            let mut index_rewriter = RefreshAggregatingIndexUwheelRewriter::default();
+            stmt.drive_mut(&mut index_rewriter);
+            user_defined_block_name = index_rewriter.user_defined_block_name;
+            // add order_by asc
+            if let Statement::Query(query) = &mut stmt {
+                let order_by_expr = OrderByExpr {
+                    expr: Expr::ColumnRef {
+                        span: None,
+                        column: ColumnRef {
+                            database: None,
+                            table: None,
+                            column: ColumnID::Name(Identifier::from_name(
+                                None,
+                                options["time_column"].clone(),
+                            )),
+                        },
+                    },
+                    asc: Some(true),
+                    nulls_first: Some(true),
+                };
+                query.order_by.push(order_by_expr);
+            }
+        } else {
+            let mut index_rewriter = RefreshAggregatingIndexRewriter::default();
+            stmt.drive_mut(&mut index_rewriter);
+            user_defined_block_name = index_rewriter.user_defined_block_name;
+        }
+        log::info!("stmmt2: {}", stmt);
+        // pre: SELECT SUM_STATE(id), t2._block_name FROM test.t2 WHERE ts >= '2023-02-17T07:00:00Z' AND ts < '2023-02-17T08:00:00Z' GROUP BY t2._block_name
+        // cur: SELECT id FROM test.t2 WHERE ts >= '2023-02-17T07:00:00Z' AND ts < '2023-02-17T08:00:00Z' ORDER BY ts ASC NULLS FIRST
 
         bind_context.planning_agg_index = true;
         let plan = if let Statement::Query(_) = &stmt {
             let select_plan = self.bind_statement(bind_context, &stmt).await?;
+            // fields: 0 2
             let opt_ctx = OptimizerContext::new(self.ctx.clone(), self.metadata.clone())
                 .with_planning_agg_index();
             Ok(optimize(opt_ctx, select_plan).await?)
         } else {
             Err(ErrorCode::UnsupportedIndex("statement is not query"))
         };
+        // fields: 0 2 3
         let plan = plan?;
         bind_context.planning_agg_index = false;
 
@@ -393,7 +462,7 @@ impl Binder {
             table_info: table.get_table_info().clone(),
             query_plan: Box::new(plan),
             segment_locs,
-            user_defined_block_name: index_rewriter.user_defined_block_name,
+            user_defined_block_name,
         };
 
         Ok(plan)

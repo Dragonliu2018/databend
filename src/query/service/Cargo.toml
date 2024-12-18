@@ -115,6 +115,7 @@ databend-storages-common-index = { workspace = true }
 databend-storages-common-io = { workspace = true }
 databend-storages-common-session = { workspace = true }
 databend-storages-common-table-meta = { workspace = true }
+databend-storages-common-uwheel-optimizer = { workspace = true }
 derive-visitor = { workspace = true }
 ethnum = { workspace = true }
 fastrace = { workspace = true }

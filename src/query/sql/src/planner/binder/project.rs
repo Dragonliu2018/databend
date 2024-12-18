@@ -187,7 +187,7 @@ impl Binder {
                     })
                 }
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?; // ERROR
 
         scalars.sort_by_key(|s| s.index);
         let eval_scalar = EvalScalar { items: scalars };

@@ -27,6 +27,8 @@ use databend_common_pipeline_core::processors::InputPort;
 use databend_common_pipeline_core::processors::ProcessorPtr;
 use databend_common_pipeline_sinks::AsyncSink;
 use databend_common_pipeline_sinks::AsyncSinker;
+use databend_storages_common_uwheel_optimizer::index::IndexBuilder;
+use databend_storages_common_uwheel_optimizer::uwheel_optimizer::UWheelOptimizer;
 use opendal::Operator;
 
 use crate::io;
@@ -103,6 +105,10 @@ impl AsyncSink for AggIndexSink {
         for (loc, indexes) in &self.location_data {
             let start = Instant::now();
             let block = DataBlock::take_blocks(&self.blocks, indexes, indexes.len());
+            log::info!("aagg1: {}", block);
+            let record_batch = block.clone().to_record_batch(&self.sink_schema)?;
+            log::info!("aagg2: {:?}", record_batch);
+
             let loc = TableMetaLocationGenerator::gen_agg_index_location_from_block_location(
                 loc,
                 self.index_id,
@@ -124,7 +130,9 @@ impl AsyncSink for AggIndexSink {
     #[async_backtrace::framed]
     async fn consume(&mut self, data_block: DataBlock) -> Result<bool> {
         let mut block = data_block;
+        log::info!("coon: {}", block);
         self.process_block(&mut block);
+        log::info!("proo: {:?}", self.blocks);
 
         Ok(false)
     }

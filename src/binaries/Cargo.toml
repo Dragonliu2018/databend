@@ -34,6 +34,7 @@ databend-enterprise-background-service = { workspace = true }
 databend-enterprise-query = { workspace = true }
 databend-query = { workspace = true }
 databend-storages-common-table-meta = { workspace = true }
+databend-storages-common-uwheel-optimizer = { workspace = true }
 limits-rs = { workspace = true }
 log = { workspace = true }
 opendal = { workspace = true }

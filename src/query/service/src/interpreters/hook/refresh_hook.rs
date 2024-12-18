@@ -18,7 +18,10 @@ use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_catalog::catalog::CatalogManager;
 use databend_common_catalog::table::Table;
 use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRefExt;
 use databend_common_meta_app::schema::IndexMeta;
 use databend_common_meta_app::schema::ListIndexesByIdReq;
 use databend_common_meta_app::schema::ListVirtualColumnsReq;
@@ -29,6 +32,7 @@ use databend_common_sql::plans::Plan;
 use databend_common_sql::plans::RefreshIndexPlan;
 use databend_common_sql::plans::RefreshTableIndexPlan;
 use databend_common_sql::plans::RefreshVirtualColumnPlan;
+use databend_common_sql::plans::RelOperator;
 use databend_common_sql::BindContext;
 use databend_common_sql::Binder;
 use databend_common_sql::Metadata;
@@ -118,6 +122,7 @@ async fn do_refresh(ctx: Arc<QueryContext>, desc: RefreshDesc) -> Result<()> {
         tasks.push(async move {
             match plan {
                 Plan::RefreshIndex(agg_index_plan) => {
+                    // agg_index_plan: 0 2 3
                     let refresh_agg_index_interpreter =
                         RefreshIndexInterpreter::try_create(ctx_cloned.clone(), *agg_index_plan)?;
                     let mut build_res = refresh_agg_index_interpreter.execute2().await?;

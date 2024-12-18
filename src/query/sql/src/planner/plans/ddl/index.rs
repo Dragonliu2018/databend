@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use databend_common_ast::ast::TableIndexType;
 use databend_common_expression::ColumnId;
@@ -33,6 +34,7 @@ pub struct CreateIndexPlan {
     pub query: String,
     pub table_id: MetaId,
     pub sync_creation: bool,
+    pub options: HashMap<String, String>, // TODO
 }
 
 /// Drop.

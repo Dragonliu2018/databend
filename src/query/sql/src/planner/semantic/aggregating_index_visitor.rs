@@ -14,12 +14,14 @@
 
 use std::collections::HashSet;
 
+use databend_common_ast::ast::BinaryOperator;
 use databend_common_ast::ast::ColumnID;
 use databend_common_ast::ast::ColumnRef;
 use databend_common_ast::ast::Expr;
 use databend_common_ast::ast::FunctionCall;
 use databend_common_ast::ast::GroupBy;
 use databend_common_ast::ast::Identifier;
+use databend_common_ast::ast::Literal;
 use databend_common_ast::ast::Query;
 use databend_common_ast::ast::SelectStmt;
 use databend_common_ast::ast::SelectTarget;
@@ -34,9 +36,11 @@ use databend_common_functions::BUILTIN_FUNCTIONS;
 use derive_visitor::DriveMut;
 use derive_visitor::Visitor;
 use derive_visitor::VisitorMut;
+use indexmap::Equivalent;
 use itertools::Itertools;
 
 use crate::planner::SUPPORTED_AGGREGATING_INDEX_FUNCTIONS;
+use crate::planner::SUPPORTED_UWHEEL_FUNCTIONS;
 
 #[derive(Debug, Clone, VisitorMut)]
 #[visitor(Expr(exit), SelectStmt(enter))]
@@ -199,11 +203,145 @@ impl AggregatingIndexRewriter {
 #[visitor(FunctionCall(enter), SelectStmt(enter), Query(enter))]
 pub struct AggregatingIndexChecker {
     not_support: bool,
+    // for uwheel index
+    has_unsupported_agg_for_uwheel: bool,
+    agg_funcs: Vec<String>,
+    no_timeproal_filter: bool, // TODO:
+    time_range: Option<(String, String)>,
+    time_column: Option<String>, // ColumnRef
+    is_date_column: bool,        // true means date column, false means timestamp column.
 }
 
 impl AggregatingIndexChecker {
     pub fn is_supported(&self) -> bool {
         !self.not_support
+    }
+
+    pub fn is_support_uwheel(&self) -> bool {
+        !self.not_support && !self.has_unsupported_agg_for_uwheel && !self.no_timeproal_filter
+    }
+
+    pub fn get_time_column(&self) -> Option<String> {
+        self.time_column.clone()
+    }
+
+    pub fn get_time_range(&self) -> Option<(String, String)> {
+        self.time_range.clone()
+    }
+
+    pub fn get_agg_funcs(&self) -> Vec<String> {
+        self.agg_funcs.clone()
+    }
+
+    pub fn is_date_column(&self) -> bool {
+        self.is_date_column
+    }
+
+    // 目前仅支持 ts >= '2023-02-17T07:00:00Z' AND ts < '2023-02-17T08:00:00Z'
+    // TODO: 判断 time_column 是否是时间类型
+    fn parse_time_filter(&mut self, expr: &Expr) {
+        match expr {
+            Expr::BinaryOp {
+                op, left, right, ..
+            } => match op {
+                BinaryOperator::And => {
+                    match left.as_ref() {
+                        Expr::BinaryOp {
+                            op, left, right, ..
+                        } => match op {
+                            BinaryOperator::Gte => {
+                                match left.as_ref() {
+                                    Expr::ColumnRef { column, .. } => {
+                                        self.time_column = Some(column.to_string());
+                                    }
+                                    _ => {
+                                        self.no_timeproal_filter = true;
+                                        return;
+                                    }
+                                }
+                                match right.as_ref() {
+                                    Expr::Literal { value, .. } => match value {
+                                        Literal::String(str) => {
+                                            self.time_range = Some((str.clone(), String::new()));
+                                        }
+                                        _ => {
+                                            self.no_timeproal_filter = true;
+                                            return;
+                                        }
+                                    },
+                                    _ => {
+                                        self.no_timeproal_filter = true;
+                                        return;
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.no_timeproal_filter = true;
+                                return;
+                            }
+                        },
+                        _ => {
+                            self.no_timeproal_filter = true;
+                            return;
+                        }
+                    }
+                    match right.as_ref() {
+                        Expr::BinaryOp {
+                            op, left, right, ..
+                        } => match op {
+                            BinaryOperator::Lt => {
+                                match left.as_ref() {
+                                    Expr::ColumnRef { column, .. } => {
+                                        if self.time_column == None
+                                            || self.time_column.as_ref().map(|s| s.as_str())
+                                                != Some(column.to_string().as_str())
+                                        {
+                                            self.no_timeproal_filter = true;
+                                            return;
+                                        }
+                                    }
+                                    _ => {
+                                        self.no_timeproal_filter = true;
+                                        return;
+                                    }
+                                }
+                                match right.as_ref() {
+                                    Expr::Literal { value, .. } => match value {
+                                        Literal::String(str) => {
+                                            self.time_range.as_mut().map(|r| r.1 = str.clone());
+                                        }
+                                        _ => {
+                                            self.no_timeproal_filter = true;
+                                            return;
+                                        }
+                                    },
+                                    _ => {
+                                        self.no_timeproal_filter = true;
+                                        return;
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.no_timeproal_filter = true;
+                                return;
+                            }
+                        },
+                        _ => {
+                            self.no_timeproal_filter = true;
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    self.no_timeproal_filter = true;
+                    return;
+                }
+            },
+            _ => {
+                self.no_timeproal_filter = true;
+                return;
+            }
+        }
     }
 
     fn enter_function_call(&mut self, func: &FunctionCall) {
@@ -221,11 +359,17 @@ impl AggregatingIndexChecker {
         }
 
         // is agg func but not support now.
-        if AggregateFunctionFactory::instance().contains(&name.name)
-            && !SUPPORTED_AGGREGATING_INDEX_FUNCTIONS.contains(&&*name.name.to_lowercase())
-        {
-            self.not_support = true;
-            return;
+        if AggregateFunctionFactory::instance().contains(&name.name) {
+            let agg_name = &&*name.name.to_lowercase();
+            if !SUPPORTED_AGGREGATING_INDEX_FUNCTIONS.contains(agg_name) {
+                self.not_support = true;
+                return;
+            }
+            if !SUPPORTED_UWHEEL_FUNCTIONS.contains(agg_name) {
+                self.has_unsupported_agg_for_uwheel = true;
+            } else {
+                self.agg_funcs.push(agg_name.to_string());
+            }
         }
 
         self.not_support = BUILTIN_FUNCTIONS
@@ -254,6 +398,25 @@ impl AggregatingIndexChecker {
             if target.has_window() {
                 self.not_support = true;
                 return;
+            }
+        }
+        // TODO: 判断 time_column 是否是时间类型
+        if let Some(selection) = &stmt.selection {
+            self.parse_time_filter(selection);
+
+            // 记录日志： Column: Some("ts"), Range: 2023-02-17T07:00:00Z to 2023-02-17T08:00:00Z, Type: TIMESTAMP
+            if let Some((start, end)) = &self.time_range {
+                log::info!(
+                    "Found time filter - Column: {:?}, Range: {} to {}, Type: {}",
+                    self.time_column,
+                    start,
+                    end,
+                    if self.is_date_column {
+                        "DATE"
+                    } else {
+                        "TIMESTAMP"
+                    }
+                );
             }
         }
     }
@@ -380,4 +543,113 @@ impl RefreshAggregatingIndexRewriter {
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, Default, VisitorMut)]
+#[visitor(Expr(exit), SelectStmt(exit))]
+pub struct RefreshAggregatingIndexUwheelRewriter {
+    pub user_defined_block_name: bool,
+    pub has_agg_function: bool,
+    pub agg_functions: Vec<(String, Vec<Expr>)>, // 新增字段，用于记录函数及其参数
+}
+
+impl RefreshAggregatingIndexUwheelRewriter {
+    fn exit_expr(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::FunctionCall {
+                func:
+                    FunctionCall {
+                        distinct,
+                        name,
+                        args,
+                        window,
+                        ..
+                    },
+                ..
+            } if !*distinct
+                && SUPPORTED_UWHEEL_FUNCTIONS
+                    .contains(&&*name.name.to_ascii_lowercase().to_lowercase())
+                && window.is_none() =>
+            {
+                self.has_agg_function = true;
+                let func_name = name.name.clone();
+                // let arg_names = args.iter().map(|arg| arg.to_string()).collect();
+                self.agg_functions.push((func_name.clone(), args.clone()));
+
+                *expr = args[0].clone();
+            }
+            _ => {}
+        }
+    }
+
+    fn exit_select_stmt(&mut self, stmt: &mut SelectStmt) {
+        // TODO
+    }
+    // fn exit_select_stmt(&mut self, stmt: &mut SelectStmt) {
+    //     let SelectStmt {
+    //         select_list,
+    //         from,
+    //         group_by,
+    //         ..
+    //     } = stmt;
+
+    //     let table = {
+    //         let table_ref = from.first().unwrap();
+    //         match table_ref {
+    //             TableReference::Table { table, .. } => table.clone(),
+    //             _ => unreachable!(),
+    //         }
+    //     };
+
+    //     let block_name_expr = Expr::ColumnRef {
+    //         span: None,
+    //         column: ColumnRef {
+    //             database: None,
+    //             table: Some(table),
+    //             column: ColumnID::Name(Identifier::from_name(stmt.span, BLOCK_NAME_COL_NAME)),
+    //         },
+    //     };
+
+    //     // if select list already contains `BLOCK_NAME_COL_NAME`
+    //     if select_list.iter().any(|target| match target {
+    //         SelectTarget::AliasedExpr { expr, .. } => match (*expr).clone().as_ref() {
+    //             Expr::ColumnRef { column, .. } => column
+    //                 .column
+    //                 .name()
+    //                 .eq_ignore_ascii_case(BLOCK_NAME_COL_NAME),
+
+    //             _ => false,
+    //         },
+    //         SelectTarget::StarColumns { .. } => false,
+    //     }) {
+    //         self.user_defined_block_name = true;
+    //     } else {
+    //         select_list.extend_one(SelectTarget::AliasedExpr {
+    //             expr: Box::new(block_name_expr.clone()),
+    //             alias: None,
+    //         });
+    //     }
+
+    //     match group_by {
+    //         Some(group_by) => match group_by {
+    //             GroupBy::Normal(groups) => {
+    //                 if !groups.iter().any(|expr| match (*expr).clone() {
+    //                     Expr::ColumnRef { column, .. } => column
+    //                         .column
+    //                         .name()
+    //                         .eq_ignore_ascii_case(BLOCK_NAME_COL_NAME),
+    //                     _ => false,
+    //                 }) {
+    //                     groups.extend_one(block_name_expr)
+    //                 }
+    //             }
+    //             _ => unreachable!(),
+    //         },
+    //         None if self.has_agg_function => {
+    //             let groups = vec![block_name_expr];
+    //             *group_by = Some(GroupBy::Normal(groups));
+    //         }
+    //         _ => {}
+    //     }
+    // }
 }
